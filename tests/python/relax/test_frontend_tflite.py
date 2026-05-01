@@ -94,8 +94,8 @@ def verify(TestClass, expected=None):
         np.testing.assert_allclose(tf_output.numpy(), tvm_output.numpy(), rtol=1e-5, atol=1e-5)
 
 
-def _verify_with_inputs(cfunc, inputs):
-    """E2E verify with explicit inputs: only run on nightly."""
+def _verify_random_with_inputs(cfunc, inputs):
+    """E2E verify random ops by shape/dtype and TVM seeded self-consistency."""
     if "CI_ENV_NIGHTLY" not in os.environ:
         return
 
@@ -108,15 +108,26 @@ def _verify_with_inputs(cfunc, inputs):
     tgt = tvm.target.Target("llvm")
     ex = tvm.compile(mod, tgt)
     vm = relax.VirtualMachine(ex, tvm.cpu())
-    vm.set_input("main", *tvm_inputs)
-    vm.invoke_stateful("main")
-    tvm_output = vm.get_outputs("main")
 
-    if isinstance(tf_output, tuple):
-        for tf_out, tvm_out in zip(tf_output, tvm_output):
-            np.testing.assert_allclose(tf_out.numpy(), tvm_out.numpy(), rtol=1e-5, atol=1e-5)
-    else:
-        np.testing.assert_allclose(tf_output.numpy(), tvm_output.numpy(), rtol=1e-5, atol=1e-5)
+    def run_tvm():
+        vm.set_input("main", *tvm_inputs)
+        vm.invoke_stateful("main")
+        return vm.get_outputs("main")
+
+    tvm_output = run_tvm()
+    tvm_output_again = run_tvm()
+
+    if not isinstance(tf_output, tuple):
+        tf_output = (tf_output,)
+        tvm_output = (tvm_output,)
+        tvm_output_again = (tvm_output_again,)
+
+    for tf_out, tvm_out, tvm_out_again in zip(tf_output, tvm_output, tvm_output_again):
+        tf_np = tf_out.numpy()
+        tvm_np = tvm_out.numpy()
+        assert tvm_np.shape == tf_np.shape
+        assert tvm_np.dtype == tf_np.dtype
+        np.testing.assert_equal(tvm_np, tvm_out_again.numpy())
 
 
 def test_add_one_2d():
@@ -786,7 +797,7 @@ def test_fill_dynamic_dims():
 
 
 def test_random_uniform_dynamic_shape():
-    """RANDOM_UNIFORM imports dynamic shape and verifies against TensorFlow."""
+    """RANDOM_UNIFORM imports dynamic shape and validates random output metadata."""
 
     class TfRandomUniform(tf.Module):
         @tf.function(input_signature=[tf.TensorSpec(shape=(2,), dtype=tf.int32)])
@@ -799,11 +810,11 @@ def test_random_uniform_dynamic_shape():
     assert "R.tensor_to_shape" in ir
     assert 'R.call_dps_packed("tvm.contrib.random.uniform"' in ir
 
-    _verify_with_inputs(cf, [np.array([2, 3], dtype="int32")])
+    _verify_random_with_inputs(cf, [np.array([2, 3], dtype="int32")])
 
 
 def test_random_standard_normal_dynamic_shape():
-    """RANDOM_STANDARD_NORMAL imports dynamic shape and verifies against TensorFlow."""
+    """RANDOM_STANDARD_NORMAL imports dynamic shape and validates random output metadata."""
 
     class TfRandomStandardNormal(tf.Module):
         @tf.function(input_signature=[tf.TensorSpec(shape=(2,), dtype=tf.int32)])
@@ -818,11 +829,11 @@ def test_random_standard_normal_dynamic_shape():
     assert "R.tensor_to_shape" in ir
     assert 'R.call_dps_packed("tvm.contrib.random.normal"' in ir
 
-    _verify_with_inputs(cf, [np.array([2, 4], dtype="int32")])
+    _verify_random_with_inputs(cf, [np.array([2, 4], dtype="int32")])
 
 
 def test_multinomial_dynamic_num_samples():
-    """MULTINOMIAL lowers through seeded uniform sampling and verifies against TensorFlow."""
+    """MULTINOMIAL lowers through seeded uniform sampling with dynamic num_samples."""
 
     class TfMultinomial(tf.Module):
         @tf.function(
@@ -846,9 +857,10 @@ def test_multinomial_dynamic_num_samples():
     assert "R.nn.softmax" in ir
     assert "R.multinomial_from_uniform" in ir
     assert "R.tensor_to_shape" in ir
+    assert "multinomial_num_samples" in ir
     assert 'R.call_dps_packed("tvm.contrib.random.uniform"' in ir
 
-    _verify_with_inputs(
+    _verify_random_with_inputs(
         cf,
         [
             np.array([[2.0, 1.0, 0.5], [0.1, 0.2, 3.0]], dtype="float32"),

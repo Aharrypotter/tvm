@@ -83,10 +83,18 @@ RandomThreadLocalEntry* RandomThreadLocalEntry::ThreadLocal() {
 namespace {
 
 unsigned CombineSeeds(int64_t seed, int64_t seed2) {
-  uint64_t combined = (static_cast<uint64_t>(static_cast<uint32_t>(seed)) << 32) |
-                      static_cast<uint32_t>(seed2);
-  combined ^= combined >> 32;
-  return static_cast<unsigned>(combined & 0xFFFFFFFFu);
+  auto mix = [](uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+  };
+
+  uint64_t seed_bits = static_cast<uint64_t>(seed);
+  uint64_t seed2_bits = static_cast<uint64_t>(seed2);
+  uint64_t combined = mix(seed_bits) ^ (mix(seed2_bits) + 0x9e3779b97f4a7c15ULL + (seed_bits << 6) +
+                                        (seed_bits >> 2));
+  return static_cast<unsigned>((combined >> 32) ^ combined);
 }
 
 RandomEngine* GetRandomEngineForArgs(const ffi::PackedArgs& args, int seed_idx, int seed2_idx) {
@@ -97,9 +105,12 @@ RandomEngine* GetRandomEngineForArgs(const ffi::PackedArgs& args, int seed_idx, 
   int64_t seed = args[seed_idx].cast<int64_t>();
   int64_t seed2 = args[seed2_idx].cast<int64_t>();
   if (seed == 0 && seed2 == 0) {
+    // TF treats seed=0 and seed2=0 as non-deterministic, so use the global engine.
     return &RandomThreadLocalEntry::ThreadLocal()->random_engine;
   }
 
+  // Seeded TFLite random ops use stateless semantics: identical seed pairs re-seed the engine
+  // and produce identical outputs on every invocation.
   static thread_local RandomEngine seeded_engine;
   seeded_engine.Seed(CombineSeeds(seed, seed2));
   return &seeded_engine;
@@ -152,29 +163,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                     DLTensor* out = nullptr;
 
                     if (args.size() == 3) {
-                      if (auto opt_out = args[0].try_cast<DLTensor*>()) {
-                        engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
-                        out = opt_out.value();
-                        low = args[1].cast<double>();
-                        high = args[2].cast<double>();
-                      } else {
-                        engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
-                        low = args[0].cast<double>();
-                        high = args[1].cast<double>();
-                        out = args[2].cast<DLTensor*>();
-                      }
+                      engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
+                      low = args[0].cast<double>();
+                      high = args[1].cast<double>();
+                      out = args[2].cast<DLTensor*>();
                     } else if (args.size() == 5) {
-                      if (auto opt_out = args[0].try_cast<DLTensor*>()) {
-                        out = opt_out.value();
-                        engine = GetRandomEngineForArgs(args, 1, 2);
-                        low = args[3].cast<double>();
-                        high = args[4].cast<double>();
-                      } else {
-                        engine = GetRandomEngineForArgs(args, 0, 1);
-                        low = args[2].cast<double>();
-                        high = args[3].cast<double>();
-                        out = args[4].cast<DLTensor*>();
-                      }
+                      engine = GetRandomEngineForArgs(args, 0, 1);
+                      low = args[2].cast<double>();
+                      high = args[3].cast<double>();
+                      out = args[4].cast<DLTensor*>();
                     } else {
                       TVM_FFI_THROW(InternalError)
                           << "tvm.contrib.random.uniform expects either 3 or 5 arguments, but got "
@@ -191,29 +188,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                     DLTensor* out = nullptr;
 
                     if (args.size() == 3) {
-                      if (auto opt_out = args[0].try_cast<DLTensor*>()) {
-                        engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
-                        out = opt_out.value();
-                        loc = args[1].cast<double>();
-                        scale = args[2].cast<double>();
-                      } else {
-                        engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
-                        loc = args[0].cast<double>();
-                        scale = args[1].cast<double>();
-                        out = args[2].cast<DLTensor*>();
-                      }
+                      engine = &RandomThreadLocalEntry::ThreadLocal()->random_engine;
+                      loc = args[0].cast<double>();
+                      scale = args[1].cast<double>();
+                      out = args[2].cast<DLTensor*>();
                     } else if (args.size() == 5) {
-                      if (auto opt_out = args[0].try_cast<DLTensor*>()) {
-                        out = opt_out.value();
-                        engine = GetRandomEngineForArgs(args, 1, 2);
-                        loc = args[3].cast<double>();
-                        scale = args[4].cast<double>();
-                      } else {
-                        engine = GetRandomEngineForArgs(args, 0, 1);
-                        loc = args[2].cast<double>();
-                        scale = args[3].cast<double>();
-                        out = args[4].cast<DLTensor*>();
-                      }
+                      engine = GetRandomEngineForArgs(args, 0, 1);
+                      loc = args[2].cast<double>();
+                      scale = args[3].cast<double>();
+                      out = args[4].cast<DLTensor*>();
                     } else {
                       TVM_FFI_THROW(InternalError)
                           << "tvm.contrib.random.normal expects either 3 or 5 arguments, but got "
