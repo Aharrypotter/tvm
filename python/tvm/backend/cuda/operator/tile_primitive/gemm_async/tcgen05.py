@@ -44,7 +44,11 @@ from tvm.tirx.layout import (
 from tvm.tirx.operator.tile_primitive import DispatchContext, predicate, register_dispatch
 from tvm.tirx.stmt import AllocBuffer, Evaluate, SeqStmt, TilePrimitiveCall
 
-from ..common import get_st_extent, smem_desc_add_16B_offset
+from ..common import (
+    cuda_arch_matches,
+    get_st_extent,
+    smem_desc_add_16B_offset,
+)
 from ..exec_scope_utils import single_thread
 from ..tma_utils import (
     SwizzleMode,
@@ -1102,12 +1106,18 @@ def gemm_async_tcgen05_impl(op_call: TilePrimitiveCall, sctx: DispatchContext) -
     priority=10,
     when=[
         predicate(
+            "sm100a_or_newer",
+            cuda_arch_matches,
+            min_version=100,
+            require_suffix="a",
+        ),
+        predicate(
             "single_thread_or_warp",
             lambda op, sctx: (
                 single_thread(op, sctx) or sctx.is_warp,
                 f"unsupported exec_scope {sctx.exec_scope}, expected single thread or warp scope",
             ),
-        )
+        ),
     ],
 )
 def gemm_async_dispatch_tcgen05(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:

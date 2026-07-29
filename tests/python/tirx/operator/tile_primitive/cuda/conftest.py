@@ -29,5 +29,8 @@ def pytest_collection_modifyitems(items):
     suite_root = Path(__file__).resolve().parent
     skip = pytest.mark.skip(reason="requires a CUDA compute capability 10.0 device")
     for item in items:
-        if Path(item.path).resolve().is_relative_to(suite_root):
+        if (
+            Path(item.path).resolve().is_relative_to(suite_root)
+            and item.get_closest_marker("cuda_sm90") is None
+        ):
             item.add_marker(skip)

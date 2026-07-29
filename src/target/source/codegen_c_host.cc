@@ -140,7 +140,11 @@ void CodeGenCHost::PrintType(const PrimType& type, std::ostream& os) {  // NOLIN
   if (type.MatchesCode(DLDataTypeCode::kDLFloat)) {
     switch (type.bits()) {
       case 16:
-        os << "half";
+        // The C host ABI carries float16 buffers as their 16-bit storage
+        // representation.  Arithmetic on float16 values must be legalized
+        // before C host codegen; using uint16_t here keeps pointer casts and
+        // bitwise copies portable without relying on an undefined `half`.
+        os << "uint16_t";
         break;
       case 32:
         os << "float";
@@ -294,20 +298,32 @@ void CodeGenCHost::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT
     static_assert(alignof(TVMFFIAny) % alignof(DLTensor) == 0, "invariant");
     size_t unit = sizeof(TVMFFIAny);
     size_t size = 0;
+    bool is_tensormap = false;
     if (type == "shape") {
       size = (num->value * sizeof(ffi::Shape::index_type) + unit - 1) / unit;
     } else if (type == "tvm_ffi_any") {
       size = (num->value * sizeof(TVMFFIAny) + unit - 1) / unit;
     } else if (type == "array") {
       size = (num->value * sizeof(DLTensor) + unit - 1) / unit;
+    } else if (type == "tensormap") {
+      // CUtensorMap has a 128-byte ABI size and requires 64-byte alignment.
+      // Keep this definition independent of CUDA headers because the C host
+      // wrapper is also emitted by CUDA-enabled builds without LLVM support.
+      size = num->value * 128;
+      is_tensormap = true;
     } else {
       TVM_FFI_THROW(InternalError) << "Unknown stack alloca type " << type;
     }
     this->PrintIndent();
-    this->stream << "TVMFFIAny " << stack_name << "[" << size << "];\n";
-    os << "((";
-    PrintType(op->ty, os);
-    os << ")" << stack_name << ")";
+    if (is_tensormap) {
+      this->stream << "alignas(64) unsigned char " << stack_name << "[" << size << "];\n";
+      os << "((void*)" << stack_name << ")";
+    } else {
+      this->stream << "TVMFFIAny " << stack_name << "[" << size << "];\n";
+      os << "((";
+      PrintType(op->ty, os);
+      os << ")" << stack_name << ")";
+    }
   } else if (op->op.same_as(builtin::tvm_call_packed_lowered())) {
     this->PrintCallPacked(op);
   } else if (op->op.same_as(builtin::tvm_call_cpacked_lowered())) {

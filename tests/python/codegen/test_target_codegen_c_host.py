@@ -245,5 +245,47 @@ def test_workspace_allocation_cast():
     built.export_library(temp.relpath("workspace.so"))
 
 
+def test_float16_storage_uses_portable_type():
+    @I.ir_module
+    class Module:
+        @T.prim_func
+        def main(A: T.Buffer((4,), "float16"), B: T.Buffer((4,), "float16")):
+            for i in range(4):
+                B[i] = A[i]
+
+    built = tvm.tirx.build(Module, target="c")
+    source = built.inspect_source()
+    assert "uint16_t* A" in source
+    assert "uint16_t* B" in source
+    assert "half*" not in source
+
+    temp = utils.tempdir()
+    path_dso = temp.relpath("float16_storage.so")
+    built.export_library(path_dso)
+    loaded = tvm.runtime.load_module(path_dso)
+    a_np = np.array([0.0, -1.5, 2.25, np.inf], dtype="float16")
+    a = tvm.runtime.tensor(a_np)
+    b = tvm.runtime.tensor(np.zeros(4, dtype="float16"))
+    loaded["main"](a, b)
+    np.testing.assert_array_equal(b.numpy().view("uint16"), a_np.view("uint16"))
+
+
+def test_tensormap_stack_allocation_uses_aligned_storage():
+    @I.ir_module(s_tir=True)
+    class Module:
+        @T.prim_func(s_tir=True)
+        def main():
+            _tensor_map: T.let[T.handle("tensormap")] = T.tvm_stack_alloca("tensormap", 2)
+            T.evaluate(0)
+
+    built = tvm.tirx.build(Module, target="c")
+    source = built.inspect_source()
+    assert "alignas(64) unsigned char stack[256];" in source
+    assert "void* _tensor_map = ((void*)stack);" in source
+
+    temp = utils.tempdir()
+    built.export_library(temp.relpath("tensormap_stack.so"))
+
+
 if __name__ == "__main__":
     tvm.testing.main()

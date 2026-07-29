@@ -32,8 +32,9 @@ class _DummyKind:
 
 
 class _DummyTarget:
-    def __init__(self, kind_name: str):
+    def __init__(self, kind_name: str, arch: str = ""):
         self.kind = _DummyKind(kind_name)
+        self.arch = arch
 
 
 class _DummyExecScope:
@@ -42,10 +43,30 @@ class _DummyExecScope:
 
 
 class _DummySctx:
-    def __init__(self, target_kind: str, exec_scope: str):
-        self.target = _DummyTarget(target_kind)
+    def __init__(self, target_kind: str, exec_scope: str, arch: str = ""):
+        self.target = _DummyTarget(target_kind, arch)
         self.exec_scope = _DummyExecScope(exec_scope)
         self.scope_kind = exec_scope
+
+
+@pytest.mark.parametrize(
+    "arch, kwargs, expected",
+    [
+        ("sm_90a", {"min_version": 90, "max_version": 100, "require_suffix": "a"}, True),
+        ("sm_90", {"min_version": 90, "max_version": 100, "require_suffix": "a"}, False),
+        ("sm_100a", {"min_version": 90, "max_version": 100, "require_suffix": "a"}, False),
+        ("sm_100", {"min_version": 100, "require_suffix": "a"}, False),
+        ("sm_100a", {"min_version": 100, "require_suffix": "a"}, True),
+        ("", {"min_version": 90}, False),
+    ],
+)
+def test_cuda_arch_matches(arch, kwargs, expected):
+    from tvm.backend.cuda.operator.tile_primitive.common import cuda_arch_matches
+
+    sctx = _DummySctx("cuda", "thread", arch=arch)
+    matched, reason = cuda_arch_matches(None, sctx, **kwargs)
+    assert matched is expected
+    assert (reason is None) is expected
 
 
 def test_dispatch_prints_predicate_reasons():

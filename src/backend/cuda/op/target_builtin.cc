@@ -336,6 +336,7 @@ const DeviceIntrinsicRegistration kDeviceIntrinsics[] = {
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_commit_group, ptx, kOpaque),
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_encode_matrix_descriptor, ptx, kOpaque),
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_fence, ptx, kOpaque),
+    TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_make_matrix_descriptor, ptx, kPure),
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_mma_async_rs, ptx, kOpaque),
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_mma_async_ss, ptx, kOpaque),
     TIRX_DEVICE_INTRIN_ALIAS(ptx_wgmma_noop_barrier, ptx, kOpaque),

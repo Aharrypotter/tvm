@@ -32,6 +32,7 @@ from tvm.tirx.cuda.operator.tile_primitive.tma_utils import (
     mma_atom_layout,
     mma_atom_shape,
     mma_shared_layout,
+    mma_shared_layout_k_major,
 )
 from tvm.tirx.exec_scope import ExecScope
 from tvm.tirx.layout import S, TileLayout
@@ -84,6 +85,7 @@ def _make_tma_call(
     s_region,
     gmem_layout,
     smem_layout,
+    gmem_strides=None,
     dtype="float16",
     direction="g2s",
     config=None,
@@ -99,7 +101,13 @@ def _make_tma_call(
     from tvm.tirx.cuda.operator.tile_primitive.copy_async.tma import copy_tma_impl
     from tvm.tirx.stmt import BufferRegion
 
-    g_buf = tvm.tirx.decl_buffer(g_shape, dtype, "A", layout=gmem_layout)
+    g_buf = tvm.tirx.decl_buffer(
+        g_shape,
+        dtype,
+        "A",
+        strides=gmem_strides,
+        layout=gmem_layout,
+    )
     s_buf = tvm.tirx.decl_buffer(s_shape, dtype, "A_smem", scope="shared.dyn", layout=smem_layout)
 
     g_ranges = [Range.from_min_extent(r[0], r[1] - r[0]) for r in g_region]
@@ -358,6 +366,7 @@ def _tma_case(
     s_region,
     gmem_layout,
     smem_layout,
+    gmem_strides=None,
     dtype="float16",
     direction="g2s",
     config=None,
@@ -387,6 +396,7 @@ def _tma_case(
             g_shape=g_shape, g_region=g_region,
             s_shape=s_shape, s_region=s_region,
             gmem_layout=gmem_layout, smem_layout=smem_layout,
+            gmem_strides=gmem_strides,
             dtype=dtype, direction=direction, config=config,
             impl_spec=impl_spec, encode_args=encode_args, raises=raises,
         ),
@@ -1020,6 +1030,7 @@ def test_copy_tma_codegen(case):
         s_region=case["s_region"],
         gmem_layout=case["gmem_layout"],
         smem_layout=case["smem_layout"],
+        gmem_strides=case["gmem_strides"],
         dtype=case["dtype"],
         direction=case["direction"],
         config=case["config"],
@@ -1044,6 +1055,28 @@ def test_copy_tma_codegen(case):
         expected_host = _build_expected_host_init(case["dtype"], case["encode_args"])
         assert len(host_init_stmts) == 1
         tvm.ir.assert_structural_equal(host_init_stmts[0], expected_host, map_free_vars=True)
+
+
+@pytest.mark.cuda_sm90
+def test_copy_tma_explicit_strided_transpose_view():
+    """The TensorMap must use Buffer.strides for a zero-copy transposed view."""
+
+    _, host_init_stmts = _make_tma_call(
+        g_shape=(16, 128, 4096),
+        g_region=((3, 4), (0, 128), (0, 64)),
+        s_shape=(2, 128, 64),
+        s_region=((0, 1), (0, 128), (0, 64)),
+        gmem_layout=TileLayout(S[16, 128, 4096]),
+        gmem_strides=(128, 1, 2048),
+        smem_layout=mma_shared_layout_k_major("bfloat16", 3, (2, 128, 64)),
+        dtype="bfloat16",
+    )
+    assert len(host_init_stmts) == 1
+    assert (
+        'T.call_packed("runtime.cuTensorMapEncodeTiled", A_tensormap, "bfloat16", '
+        "5, A, 64, 8, 2, 512, 16, 4096, 128, 32768, 256, 64, 8, 2, 8, 1, "
+        "1, 1, 1, 1, 1, 0, 3, 2, 0)" in str(host_init_stmts[0])
+    )
 
 
 # Section 3: TMA special cases (symbolic dimension, buffer view)
@@ -1430,6 +1463,85 @@ def test_copy_tma_gpu_smoke_g2s(task, dtype):
         B = tvm.runtime.tensor(B_np, dev)
         mod(A, B)
         np.testing.assert_allclose(B_ref, B.numpy())
+
+    tvm.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda_sm90
+@pytest.mark.skipif(not env.has_cuda_compute(9), reason="need cuda compute >= 9.0")
+def test_copy_tma_gpu_explicit_strided_transpose_view():
+    """Load a zero-copy transposed global view into K-major shared memory."""
+
+    tokens = 64
+    heads = 16
+    head_size = 128
+    selected_head = 3
+    shared_layout = mma_shared_layout_k_major("bfloat16", 3, (head_size, tokens))
+
+    # fmt: off
+    @T.prim_func
+    def copy_alias(A_ptr: T.handle, B_ptr: T.handle) -> None:
+        A = T.match_buffer(A_ptr, (tokens, heads, head_size), "bfloat16")
+        B = T.match_buffer(B_ptr, (head_size, tokens), "bfloat16")
+        A_alias = T.decl_buffer(
+            (heads, head_size, tokens),
+            "bfloat16",
+            data=A.data,
+            strides=(head_size, 1, heads * head_size),
+        )
+
+        T.device_entry()
+        cta_id = T.cta_id([1])
+        tid = T.thread_id([128])
+        A_smem = T.alloc_buffer(
+            (head_size, tokens), "bfloat16", scope="shared", layout=shared_layout
+        )
+        mbarrier = T.alloc_buffer((1,), "uint64", scope="shared")
+
+        if tid == 0:
+            T.ptx.mbarrier.init(mbarrier.ptr_to([0]), 1)
+        T.ptx.fence.proxy_async("shared::cta")
+        T.cuda.cta_sync()
+
+        if tid == 0:
+            Tx.copy_async(
+                A_smem[:, :],
+                A_alias[selected_head, :, :],
+                dispatch="tma",
+                mbar=mbarrier.ptr_to([0]),
+                cta_group=1,
+            )
+            T.ptx.mbarrier.arrive.expect_tx(
+                mbarrier.ptr_to([0]), head_size * tokens * 2
+            )
+        T.ptx.mbarrier.try_wait(mbarrier.ptr_to([0]), 0)
+        T.cuda.cta_sync()
+        Tx.cta.copy(B[:, :], A_smem[:, :])
+    # fmt: on
+
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_90a"})
+    with target:
+        mod = tvm.compile(
+            tvm.IRModule({"main": copy_alias}),
+            target=target,
+            tir_pipeline="tirx",
+        )
+
+    np.random.seed(0)
+    A_np = tvm.testing.generate_random_array("bfloat16", (tokens, heads, head_size))
+    B_np = np.zeros(
+        (head_size, tokens),
+        dtype=tvm.testing.np_dtype_from_str("bfloat16"),
+    )
+    B_ref = A_np[:, selected_head, :].T
+
+    def run_and_check():
+        dev = tvm.cuda(0)
+        A = tvm.runtime.tensor(A_np, dev)
+        B = tvm.runtime.tensor(B_np, dev)
+        mod(A, B)
+        np.testing.assert_array_equal(B_ref, B.numpy())
 
     tvm.testing.run_with_gpu_lock(run_and_check)
 

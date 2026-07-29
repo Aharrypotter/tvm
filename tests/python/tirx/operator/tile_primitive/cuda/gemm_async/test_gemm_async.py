@@ -273,7 +273,7 @@ def test_gemm_tcgen05_cta_group_1(task):
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async})
         # mod.show()
@@ -395,7 +395,7 @@ def test_gemm_tcgen05_cta_group_1_layout_f_m64():
     # fmt: on
 
     np.random.seed(0)
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.compile(tvm.IRModule({"main": gemm_layout_f}), target=target, tir_pipeline="tirx")
 
@@ -532,7 +532,7 @@ def test_gemm_tcgen05_cta_group_2(task):
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async})
         mod.show()
@@ -671,7 +671,7 @@ def test_gemm_tcgen05_cta_group_2_layout_b():
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async})
         mod.show()
@@ -854,7 +854,7 @@ def test_gemm_block_scaled_fp8_cta_group_1(task):
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async_fn})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -1066,7 +1066,7 @@ def test_gemm_block_scaled_fp8_cta_group_2(task):
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async_fn})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -1252,7 +1252,7 @@ def test_gemm_block_scaled_nvfp4_cta_group_1():
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async_fn})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -1448,7 +1448,7 @@ def test_gemm_block_scaled_nvfp4_cta_group_2():
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async_fn})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -1658,7 +1658,7 @@ def test_gemm_block_scaled_fp8_sf_id():
 
     np.random.seed(42)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async_fn})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -1963,7 +1963,7 @@ def test_gemm_tcgen05_arbitrary_tiles(task):
 
     np.random.seed(0)
 
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.IRModule({"main": gemm_async})
         mod = tvm.compile(mod, target=target, tir_pipeline="tirx")
@@ -2076,8 +2076,12 @@ def test_gemm_tcgen05_contiguous_kslice_partial_k(k_lo, k_hi):
     # fmt: on
 
     np.random.seed(0)
-    with tvm.target.Target("cuda"):
-        mod = tvm.compile(tvm.IRModule({"main": gemm_async}), target="cuda", tir_pipeline="tirx")
+    with tvm.target.Target({"kind": "cuda", "arch": "sm_100a"}):
+        mod = tvm.compile(
+            tvm.IRModule({"main": gemm_async}),
+            target={"kind": "cuda", "arch": "sm_100a"},
+            tir_pipeline="tirx",
+        )
     A_np = np.random.randn(*A_shape).astype(dtype)
     B_np = np.random.randn(*B_shape).astype(dtype)
     C_np = np.zeros(C_shape, "float32")
@@ -2169,7 +2173,7 @@ def _run_dense_gemm(
             T.ptx.tcgen05.dealloc(tmem_addr[0], n_cols=cols_alloc, cta_group=1)
 
     np.random.seed(0)
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.compile(tvm.IRModule({"main": gemm_async}), target=target, tir_pipeline="tirx")
 
@@ -2299,7 +2303,7 @@ def test_gemm_smem_desc_hoist_vs_recompute(smem_desc):
 
     Both must emit the MMA; the descriptor-construction fingerprints differ.
     """
-    target = tvm.target.Target("cuda")
+    target = tvm.target.Target({"kind": "cuda", "arch": "sm_100a"})
     with target:
         mod = tvm.compile(
             tvm.IRModule({"main": _build_smem_desc_kernel(smem_desc)}),

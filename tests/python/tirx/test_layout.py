@@ -51,6 +51,8 @@ from tvm.tirx.layout import (
     warpid,
     wg_local_layout,
     wgid,
+    wgmma_a_register_layout,
+    wgmma_accumulator_layout,
     wid_in_wg,
 )
 
@@ -168,6 +170,76 @@ def test_wg_local_layout_helper():
     layout_rows = wg_local_layout(8, rows=64)
     expected_rows = TileLayout(S[(64, 8) : (1 @ tid_in_wg, 1)])
     assert_structural_equal(layout_rows.canonicalize(), expected_rows.canonicalize())
+
+
+@pytest.mark.parametrize("n", [64, 128])
+def test_wgmma_accumulator_layout_helper(n):
+    layout = wgmma_accumulator_layout(64, n)
+    expected = TileLayout(
+        S[
+            (4, 8, 2, n // 8, 4, 2) : (
+                16 @ wid_in_wg,
+                4 @ laneid,
+                2,
+                4,
+                1 @ laneid,
+                1,
+            )
+        ]
+    )
+    assert_structural_equal(layout.canonicalize(), expected.canonicalize())
+    assert int(layout.storage().size()) == n // 2
+
+
+def test_wgmma_accumulator_layout_shards_consecutive_m64_tiles_on_warpgroup():
+    layout = wgmma_accumulator_layout(128, 64)
+    expected = TileLayout(
+        S[
+            (2, 4, 8, 2, 8, 4, 2) : (
+                4096 @ wgid,
+                16 @ wid_in_wg,
+                4 @ laneid,
+                2,
+                4,
+                1 @ laneid,
+                1,
+            )
+        ]
+    )
+    assert_structural_equal(layout.canonicalize(), expected.canonicalize())
+    assert int(layout.storage().size()) == 32
+
+
+def test_wgmma_a_register_layout_helper():
+    layout = wgmma_a_register_layout(64, 64, "bfloat16")
+    expected = TileLayout(
+        S[
+            (4, 8, 2, 8, 4, 2) : (
+                16 @ wid_in_wg,
+                4 @ laneid,
+                2,
+                4,
+                1 @ laneid,
+                1,
+            )
+        ]
+    )
+    assert_structural_equal(layout.canonicalize(), expected.canonicalize())
+    assert int(layout.storage().size()) == 32
+
+
+@pytest.mark.parametrize(
+    "factory, args",
+    [
+        (wgmma_accumulator_layout, (96, 64)),
+        (wgmma_accumulator_layout, (64, 60)),
+        (wgmma_a_register_layout, (64, 24, "float16")),
+        (wgmma_a_register_layout, (64, 64, "float32")),
+    ],
+)
+def test_wgmma_layout_helpers_reject_unsupported_shapes(factory, args):
+    with pytest.raises(ValueError):
+        factory(*args)
 
 
 def test_spec_builder():

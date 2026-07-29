@@ -308,7 +308,16 @@ class L1Result:
 
 
 def _gmem_layout(g_buf: Buffer) -> TileLayout:
-    layout = g_buf.layout
+    # ``T.decl_buffer(..., strides=...)`` is a zero-copy global-memory view:
+    # its explicit strides define the address map even though the script
+    # builder also attaches a default contiguous TileLayout for the declared
+    # shape.  Building a TensorMap from that default layout silently describes
+    # the wrong tensor.  Reconstruct the memory layout from Buffer.strides so
+    # the host descriptor and device coordinates share the buffer's indexing
+    # contract.
+    layout = (
+        TileLayout(S[tuple(g_buf.shape) : tuple(g_buf.strides)]) if g_buf.strides else g_buf.layout
+    )
     if not isinstance(layout, TileLayout):
         # cuTensorMap requires a plain memory layout on gmem side.
         raise ValueError(f"TMA gmem layout must be a TileLayout; got {type(layout).__name__}")
@@ -812,7 +821,11 @@ def _assemble_plan(
         issue_axes=issue_axes,
         tensor_ptr=g_buf.data,
         elem_bytes=elem_bytes,
-        elem_dtype=g_buf.dtype,
+        # ``Buffer.dtype`` is a PrimType with the tvm-ffi object model.  Keep
+        # the host-side TensorMap plan field as its declared string contract;
+        # otherwise T.call_packed receives a type node where it requires an
+        # expression and TMA lowering fails before CUDA code generation.
+        elem_dtype=str(g_buf.dtype),
     )
     return _merge_contig_full_box_dims(plan, analyzer)
 

@@ -564,7 +564,13 @@ except NameError:  # pragma: no cover
     __all__ = []  # type: ignore[var-annotated]
 __all__ += list(_AXIS_NAMES)
 __all__ += ["R", "S"]
-__all__ += ["tcgen05_atom_layout", "tmem_datapath_layout", "wg_local_layout"]
+__all__ += [
+    "tcgen05_atom_layout",
+    "tmem_datapath_layout",
+    "wg_local_layout",
+    "wgmma_a_register_layout",
+    "wgmma_accumulator_layout",
+]
 
 
 # ============================================================================
@@ -661,6 +667,81 @@ def wg_local_layout(cols, rows=128):
     so each thread owns one row and contiguous ``cols`` local elements.
     """
     return TileLayout(S[(rows, cols) : (1 @ Axis.tid_in_wg, 1)])
+
+
+def wgmma_accumulator_layout(m, n, dtype="float32"):
+    """Return the SM90 WGMMA FP32 accumulator register layout.
+
+    Each WGMMA instruction fixes ``M=64`` and distributes an ``m64nN``
+    accumulator over one 128-thread warpgroup.  ``m`` may contain several
+    consecutive m64 tiles; in that case the leading tile is sharded on
+    ``wgid`` so adjacent warpgroups can own a larger resident fragment
+    without replicating its register storage.  For ``lane = 4*g + t`` and
+    warp ``w`` each thread owns:
+
+    ``row = 16*w + g + 8*rM`` and
+    ``col = 8*n8 + 2*t + rN``.
+
+    The non-thread strides encode the PTX accumulator enumeration
+    ``4*n8 + 2*rM + rN``.
+    """
+
+    m, n = int(m), int(n)
+    if m < 64 or m % 64 != 0:
+        raise ValueError(f"WGMMA accumulator layout requires m >= 64 and divisible by 64, got {m}")
+    if n < 8 or n > 256 or n % 8 != 0:
+        raise ValueError(f"WGMMA accumulator layout requires n in [8, 256] by 8, got {n}")
+    if str(dtype) != "float32":
+        raise ValueError(f"WGMMA accumulator layout requires float32, got {dtype}")
+    instruction_shape = (4, 8, 2, n // 8, 4, 2)
+    instruction_stride = (
+        16 @ Axis.wid_in_wg,
+        4 @ Axis.laneid,
+        2,
+        4,
+        1 @ Axis.laneid,
+        1,
+    )
+    if m == 64:
+        return TileLayout(S[instruction_shape:instruction_stride])
+    return TileLayout(
+        S[
+            (m // 64, *instruction_shape) : (
+                64 * n @ Axis.wgid,
+                *instruction_stride,
+            )
+        ]
+    )
+
+
+def wgmma_a_register_layout(m, k, dtype):
+    """Return the SM90 WGMMA RS A-operand register layout.
+
+    The logical A operand is ``[M, K]`` with ``M=64``.  Each lane owns two
+    contiguous 16-bit values per 8-wide K slice and two rows separated by
+    eight.  Reinterpreting the storage as uint32 therefore yields the PTX
+    A-register order expected by ``wgmma.mma_async.rs``.
+    """
+
+    m, k = int(m), int(k)
+    if m != 64:
+        raise ValueError(f"WGMMA A-register layout requires m=64, got {m}")
+    if k < 16 or k % 16 != 0:
+        raise ValueError(f"WGMMA A-register layout requires k >= 16 and divisible by 16, got {k}")
+    if str(dtype) not in ("float16", "bfloat16"):
+        raise ValueError(f"WGMMA A-register layout requires float16/bfloat16, got {dtype}")
+    return TileLayout(
+        S[
+            (4, 8, 2, k // 8, 4, 2) : (
+                16 @ Axis.wid_in_wg,
+                4 @ Axis.laneid,
+                2,
+                4,
+                1 @ Axis.laneid,
+                1,
+            )
+        ]
+    )
 
 
 # Allowed (.shape, .num) combinations for tcgen05.ld/st atoms.

@@ -276,8 +276,37 @@ def sm_version_ok(
     op: TilePrimitiveCall, sctx: DispatchContext, min_version: int
 ) -> tuple[bool, str | None]:
     """Check if SM version >= min_version. Usable as a dispatch predicate."""
-    target_arch = sctx.target.arch if hasattr(sctx.target, "arch") else ""
-    sm_match = re.match(r"sm_(\d+)", target_arch)
-    sm_version = int(sm_match.group(1)) if sm_match else 0
-    ok = sm_version >= min_version
-    return (ok, None if ok else f"sm_version {sm_version} < {min_version}")
+    return cuda_arch_matches(op, sctx, min_version=min_version)
+
+
+def cuda_arch_matches(
+    op: TilePrimitiveCall,  # pylint: disable=unused-argument
+    sctx: DispatchContext,
+    *,
+    min_version: int | None = None,
+    max_version: int | None = None,
+    require_suffix: str | None = None,
+) -> tuple[bool, str | None]:
+    """Match a CUDA architecture range and optional feature suffix.
+
+    ``max_version`` is exclusive.  The suffix check is exact, so an
+    architecture-specific instruction such as WGMMA can require ``sm_90a``
+    without silently accepting generic ``sm_90`` or a different feature
+    target.  A missing or malformed target architecture always fails closed.
+    """
+
+    target_arch = str(getattr(getattr(sctx, "target", None), "arch", "") or "")
+    sm_match = re.fullmatch(r"sm_(\d+)([a-z]*)", target_arch)
+    if sm_match is None:
+        return False, f"expected explicit CUDA architecture, got {target_arch!r}"
+
+    sm_version = int(sm_match.group(1))
+    suffix = sm_match.group(2)
+    if min_version is not None and sm_version < min_version:
+        return False, f"CUDA architecture {target_arch} is below sm_{min_version}"
+    if max_version is not None and sm_version >= max_version:
+        return False, f"CUDA architecture {target_arch} is not below sm_{max_version}"
+    if require_suffix is not None and suffix != require_suffix:
+        expected = f"sm_{sm_version}{require_suffix}"
+        return False, f"CUDA architecture {target_arch} does not match required {expected}"
+    return True, None

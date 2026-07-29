@@ -1175,12 +1175,17 @@ void CodeGenC::VisitStmt_(const BindNode* op) {
     var_idmap_[op->var.get()] = value;
   } else {
     PrintIndent();
-    bool is_pointer = op->var->ty.as<PointerTypeNode>();
+    auto* pointer_type = op->var->ty.as<PointerTypeNode>();
+    bool is_pointer = pointer_type != nullptr;
+    bool is_tensormap_pointer =
+        pointer_type != nullptr && pointer_type->element_type.as<TensorMapTypeNode>();
     if (is_pointer && handle_data_type_.count(op->var.get())) {
       PrintType(handle_data_type_.at(op->var.get()), stream);
       stream << "* " << AllocVarID(op->var.get()) << " = (";
       PrintType(handle_data_type_.at(op->var.get()), stream);
       stream << "*)" << value << ";\n";
+    } else if (is_tensormap_pointer) {
+      stream << "void* " << AllocVarID(op->var.get()) << " = " << value << ";\n";
     } else {
       PrintType(op->var->ty, this->stream);
       this->stream << ' ' << AllocVarID(op->var.get()) << " = " << value << ";\n";

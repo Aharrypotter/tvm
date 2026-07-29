@@ -33,6 +33,17 @@ from ._common import _TID_AXIS_FOR_SCOPE
 from .reg import _axis_decl
 from .utils import _is_valid_copy
 
+_VALID_PREFIX_ELEMENTS = "valid_prefix_elements"
+
+
+def _reject_bounded_prefix(op_call: TilePrimitiveCall, _sctx: DispatchContext):
+    """Do not silently erase bounded-prefix semantics in the scalar fallback."""
+    if op_call.config.get(_VALID_PREFIX_ELEMENTS) is not None:
+        return False, (
+            "valid_prefix_elements is supported only by the vectorized global<->shared dispatch"
+        )
+    return True, None
+
 
 def _region_st_extent(buffer_region):
     region = buffer_region.region
@@ -110,7 +121,10 @@ def _emit_fallback(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFun
     "cuda",
     variant="fallback",
     priority=0,
-    when=[predicate("validate_copy_op", _is_valid_copy)],
+    when=[
+        predicate("validate_copy_op", _is_valid_copy),
+        predicate("reject_bounded_prefix", _reject_bounded_prefix),
+    ],
 )
 def copy_schedule_fallback(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFunc:
     return _emit_fallback(op_call, sctx)

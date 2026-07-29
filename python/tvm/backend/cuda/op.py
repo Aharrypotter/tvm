@@ -1802,6 +1802,12 @@ def ptx_wgmma_encode_matrix_descriptor(desc, addr, ldo, sdo, swizzle):
     return call_intrin("", "tirx.ptx.wgmma_encode_matrix_descriptor", desc, addr, ldo, sdo, swizzle)
 
 
+def ptx_wgmma_make_matrix_descriptor(addr, ldo, sdo, swizzle):
+    """Return a WGMMA shared-memory descriptor as a pure uint64 expression."""
+
+    return call_intrin("uint64", "tirx.ptx.wgmma_make_matrix_descriptor", addr, ldo, sdo, swizzle)
+
+
 def ptx_wgmma_noop_barrier(reg):
     """TVM intrinsic to call "" : "+{format}"(reg)::"memory"
 

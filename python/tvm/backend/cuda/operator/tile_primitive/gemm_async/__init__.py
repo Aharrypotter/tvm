@@ -16,3 +16,4 @@
 # under the License.
 
 from .tcgen05 import *
+from .wgmma import *

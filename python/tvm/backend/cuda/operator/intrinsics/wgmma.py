@@ -82,6 +82,29 @@ device_intrinsic(
     extra_deps=("gmma_descriptor",),
 )
 
+device_intrinsic(
+    "ptx_wgmma_make_matrix_descriptor",
+    helper_name="ptx_wgmma_make_matrix_descriptor",
+    c_signature="(void* addr, int ldo, int sdo, int swizzle)",
+    return_type="uint64_t",
+    body=(
+        "  GmmaDescriptor desc{};\n"
+        "  switch (swizzle) {\n"
+        "    case 0: desc.bitfield.layout_type_ = uint8_t(0); break;\n"
+        "    case 1: desc.bitfield.layout_type_ = uint8_t(3); break;\n"
+        "    case 2: desc.bitfield.layout_type_ = uint8_t(2); break;\n"
+        "    case 3: desc.bitfield.layout_type_ = uint8_t(1); break;\n"
+        "  }\n"
+        "  uint32_t start_address = __cvta_generic_to_shared(addr);\n"
+        "  desc.bitfield.start_address_ = static_cast<uint16_t>(start_address >> 4);\n"
+        "  desc.bitfield.base_offset_ = uint8_t(0);\n"
+        "  desc.bitfield.stride_byte_offset_ = static_cast<uint32_t>(sdo);\n"
+        "  desc.bitfield.leading_byte_offset_ = static_cast<uint32_t>(ldo);\n"
+        "  return static_cast<uint64_t>(desc);"
+    ),
+    extra_deps=("gmma_descriptor",),
+)
+
 
 # =============================================================================
 # wgmma_noop_barrier — empty asm with one inout register operand. Two
@@ -104,7 +127,7 @@ device_intrinsic(
 
 @register_codegen("ptx_wgmma_noop_barrier")
 def codegen_ptx_wgmma_noop_barrier(reg):
-    dtype = str(reg.dtype)
+    dtype = str(reg.ty.dtype)
     dtype_enum = PTXDataType.from_string(dtype)
     if dtype_enum == PTXDataType.UINT32:
         op_name = "tirx.ptx_wgmma_noop_barrier_uint32"
@@ -249,7 +272,7 @@ def _wgmma_rs_parts(*args):
         "("
         + ", ".join(
             [f"float& p_acc{i}" for i in range(num_accums)]
-            + [f"uint32_t& p_A{i}" for i in range(num_A_regs)]
+            + [f"uint32_t p_A{i}" for i in range(num_A_regs)]
             + ["uint64_t p_descB", "int p_scaleD"]
         )
         + ")"

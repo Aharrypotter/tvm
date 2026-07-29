@@ -167,7 +167,10 @@ addopts = "-v --tb=short"
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-markers = ["gpu: Mark a test as requiring a GPU"]
+markers = [
+  "gpu: Mark a test as requiring a GPU",
+  "cuda_sm90: Mark a CUDA test as targeting compute capability 9.0",
+]
 
 [tool.ruff]
 include = [

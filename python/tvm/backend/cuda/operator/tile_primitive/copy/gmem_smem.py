@@ -25,12 +25,15 @@ consecutive fused-index slots. Layout / partition algorithm lives in
 ``_common.py`` and is shared with ``ldgsts.py``.
 """
 
+import itertools
+
 import tvm
 from tvm.runtime import DataType
 from tvm.script import tirx as T
 from tvm.tirx import Buffer, PrimFunc
 from tvm.tirx import Var as _TirVar
 from tvm.tirx.expr import IntImm as _IntImm
+from tvm.tirx.layout import TileLayout
 from tvm.tirx.operator.tile_primitive.dispatcher import (
     predicate,
     register_dispatch,
@@ -58,6 +61,46 @@ _GMEM_SMEM_PAIRS = [
     ("global", "shared*"),
     ("shared*", "global"),
 ]
+
+_VALID_PREFIX_ELEMENTS = "valid_prefix_elements"
+_REMATERIALIZE_SWIZZLE_OFFSETS = "rematerialize_swizzle_offsets"
+
+
+def _logical_prefix_layout_ok(op_call: TilePrimitiveCall) -> tuple[bool, str | None]:
+    """Require the global region's logical axis order to match physical traversal.
+
+    ``align_layouts_gs`` sorts the global shard by descending physical stride
+    before it carves ``[outer, thread, vector]``.  A bounded logical prefix is
+    therefore meaningful only when that sort is already the region's logical
+    iteration order.  Singleton axes are ignored because they contribute no
+    traversal choice.  This deliberately rejects transposed/permuted global
+    layouts instead of silently interpreting the prefix in physical order.
+    """
+    op_call = TilePrimitiveCall.downcast(op_call)
+    g_br = op_call.src if op_call.src.buffer.scope() == "global" else op_call.dst
+    g_buf = g_br.buffer
+    g_region = [(r.min, r.min + r.extent) for r in g_br.region]
+    try:
+        sliced = g_buf.layout.slice(list(g_buf.shape), g_region)
+    except Exception as err:  # pragma: no cover - diagnostic path
+        return False, f"cannot slice global layout for bounded prefix: {err}"
+    if not isinstance(sliced, TileLayout):
+        return False, (
+            "valid_prefix_elements requires a plain global TileLayout whose "
+            "logical order can be proven"
+        )
+    active_strides = [int(it.stride) for it in sliced.shard if int(it.extent) > 1]
+    if any(stride <= 0 for stride in active_strides):
+        return False, "valid_prefix_elements requires positive global strides"
+    if any(
+        outer_stride <= inner_stride
+        for outer_stride, inner_stride in itertools.pairwise(active_strides)
+    ):
+        return False, (
+            "valid_prefix_elements requires logical axes already ordered by "
+            "strictly descending global stride"
+        )
+    return True, None
 
 
 def _divides_thread_cnt(
@@ -88,6 +131,30 @@ def _divides_thread_cnt(
     return True, None
 
 
+def _rematerialized_swizzle_offsets_ok(
+    op_call: TilePrimitiveCall,
+) -> tuple[bool, str | None]:
+    """Validate the opt-in bounded-copy swizzle rematerialization contract."""
+    op_call = TilePrimitiveCall.downcast(op_call)
+    rematerialize = op_call.config.get(_REMATERIALIZE_SWIZZLE_OFFSETS, False)
+    if rematerialize is False:
+        return True, None
+    if rematerialize is not True:
+        return False, f"{_REMATERIALIZE_SWIZZLE_OFFSETS} must be a boolean"
+    if op_call.config.get(_VALID_PREFIX_ELEMENTS) is None:
+        return False, (f"{_REMATERIALIZE_SWIZZLE_OFFSETS}=True requires {_VALID_PREFIX_ELEMENTS}")
+    s_buf = (
+        op_call.src.buffer
+        if op_call.src.buffer.scope().startswith("shared")
+        else op_call.dst.buffer
+    )
+    if get_swizzle(s_buf.layout) is None:
+        return False, (
+            f"{_REMATERIALIZE_SWIZZLE_OFFSETS}=True requires a swizzled shared-memory layout"
+        )
+    return True, None
+
+
 def _is_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> tuple[bool, str | None]:
     if not sctx.is_target("cuda"):
         return False, "non-cuda target"
@@ -98,6 +165,12 @@ def _is_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> tuple[bo
         lambda: _is_valid_copy(op_call, sctx),
         lambda: _scope_allowed(op_call, sctx, allowed_pairs=_GMEM_SMEM_PAIRS),
         lambda: _divides_thread_cnt(op_call, sctx),
+        lambda: _rematerialized_swizzle_offsets_ok(op_call),
+        lambda: (
+            _logical_prefix_layout_ok(op_call)
+            if op_call.config.get(_VALID_PREFIX_ELEMENTS) is not None
+            else (True, None)
+        ),
     ):
         ok, msg = check()
         if not ok:
@@ -140,6 +213,19 @@ def _emit_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFu
     vec_bits = vec_len * elem_bits
     num_bytes = vec_bits // 8
     vec, ptx_type = copy_ptx_form(num_bytes)
+    valid_prefix_elements = op_call.config.get(_VALID_PREFIX_ELEMENTS)
+    rematerialize_swizzle_offsets = (
+        op_call.config.get(_REMATERIALIZE_SWIZZLE_OFFSETS, False) is True
+    )
+    if valid_prefix_elements is not None:
+        if isinstance(valid_prefix_elements, int):
+            valid_prefix_elements = _IntImm("int32", valid_prefix_elements)
+        analyzer = tvm.arith.Analyzer()
+        if not analyzer.can_prove_equal(valid_prefix_elements % vec_len, 0):
+            raise ValueError(
+                "valid_prefix_elements must be provably divisible by the selected "
+                f"vector length {vec_len}, got {valid_prefix_elements}"
+            )
 
     # Partition guarantees ``prod(s_p.shard.extents) == prod(g_p.shard.extents)
     # == n_elements`` (the total transfer count). Express the per-thread
@@ -191,7 +277,7 @@ def _emit_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFu
     # doesn't AST-evaluate a "dead" ternary branch.
     swizzle = get_swizzle(s_buf.layout)
     swizzle_pattern = None
-    if swizzle is not None and outer_iters_s:
+    if swizzle is not None and outer_iters_s and not rematerialize_swizzle_offsets:
         if tid_axis_name is not None:
             _tid_placeholder = _TirVar(tid_axis_name, "int32")
         else:
@@ -271,7 +357,7 @@ def _emit_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFu
         tid = _decl_tid()
         _setup_swizzle(tid)
         tmp = T.alloc_local((vec_len,), src.dtype)
-        tmp_ptr = tmp.ptr_to([0])
+        tmp_ptr = T.meta_var(tmp.ptr_to([0]))
         # NB: pass typed ptr_to(...) directly to _ptr_off; caching in a
         # local var turns it into void* + offset = byte arithmetic →
         # misaligned vector ops.
@@ -284,35 +370,59 @@ def _emit_gmem_smem(op_call: TilePrimitiveCall, sctx: DispatchContext) -> PrimFu
         # at vec=4 ⇒ 2048 iters; ldgsts test4 ⇒ ~4k iters once both
         # g2s/s2g sites add up) this floods the kernel and nvcc times out.
         for f in range(total_outer):
-            s_lin = s_p.apply(f, tid, v0, shape=apply_shape)["m"]
-            g_lin = g_p.apply(f, tid, v0, shape=apply_shape)["m"]
-            s_off = _s_off(f, s_lin)
-            s_ptr = _ptr_off(s_buf.ptr_to(s_zero), s_off)
-            g_ptr = _ptr_off(g_buf.ptr_to(g_zero), g_lin)
+            logical_base = T.meta_var((f * thread_cnt + tid) * vec_len)
+            # These are address expressions, not mutable per-thread state.
+            # Keep them as parser-time expressions so TIRx does not
+            # materialize three one-element local scalar buffers per copy
+            # site. The pointer calls below still bind the complete typed
+            # address exactly once at each use.
+            s_lin = T.meta_var(s_p.apply(f, tid, v0, shape=apply_shape)["m"])
+            g_lin = T.meta_var(g_p.apply(f, tid, v0, shape=apply_shape)["m"])
+            s_off = T.meta_var(_s_off(f, s_lin))
+            s_ptr = T.meta_var(_ptr_off(s_buf.ptr_to(s_zero), s_off))
+            g_ptr = T.meta_var(_ptr_off(g_buf.ptr_to(g_zero), g_lin))
             if g_is_src:
-                T.ptx.ld(
-                    g_ptr,
-                    copy_ptx_ld_return_type(ptx_type),
-                    ptx_type,
-                    dst=tmp_ptr,
-                    space="global",
-                    vec=vec,
-                )
+                if valid_prefix_elements is None:
+                    T.ptx.ld(
+                        g_ptr,
+                        copy_ptx_ld_return_type(ptx_type),
+                        ptx_type,
+                        dst=tmp_ptr,
+                        space="global",
+                        vec=vec,
+                    )
+                else:
+                    if logical_base + vec_len <= valid_prefix_elements:
+                        T.ptx.ld(
+                            g_ptr,
+                            copy_ptx_ld_return_type(ptx_type),
+                            ptx_type,
+                            dst=tmp_ptr,
+                            space="global",
+                            vec=vec,
+                        )
+                    else:
+                        for item in T.unroll(vec_len):
+                            tmp[item] = T.cast(0, src.dtype)
                 T.ptx.st(
                     s_ptr, src=tmp_ptr, space="shared", vec=vec, ptx_type=ptx_type
                 )
             else:
-                T.ptx.ld(
-                    s_ptr,
-                    copy_ptx_ld_return_type(ptx_type),
-                    ptx_type,
-                    dst=tmp_ptr,
-                    space="shared",
-                    vec=vec,
-                )
-                T.ptx.st(
-                    g_ptr, src=tmp_ptr, space="global", vec=vec, ptx_type=ptx_type
-                )
+                if (
+                    valid_prefix_elements is None
+                    or logical_base + vec_len <= valid_prefix_elements
+                ):
+                    T.ptx.ld(
+                        s_ptr,
+                        copy_ptx_ld_return_type(ptx_type),
+                        ptx_type,
+                        dst=tmp_ptr,
+                        space="shared",
+                        vec=vec,
+                    )
+                    T.ptx.st(
+                        g_ptr, src=tmp_ptr, space="global", vec=vec, ptx_type=ptx_type
+                    )
     # fmt: on
     return impl
 

@@ -267,6 +267,7 @@ class WgmmaNamespace:
         self.noop_barrier = _op_wrapper(_cuda_op.ptx_wgmma_noop_barrier)
         self.mma_async = WgmmaMmaAsyncNamespace()
         self.encode_matrix_descriptor = _op_wrapper(_cuda_op.ptx_wgmma_encode_matrix_descriptor)
+        self.make_matrix_descriptor = _op_wrapper(_cuda_op.ptx_wgmma_make_matrix_descriptor)
 
 
 class WgmmaMmaAsyncNamespace:

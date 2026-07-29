@@ -26,10 +26,16 @@ import pytest
 
 import tvm
 import tvm.testing
+from tvm.backend.cuda.operator.tile_primitive.copy.gmem_smem import (
+    _logical_prefix_layout_ok,
+    _rematerialized_swizzle_offsets_ok,
+)
 from tvm.script import tirx as T
 from tvm.script.tirx import tile as Tx
 from tvm.testing import env
 from tvm.tirx.layout import ComposeLayout, S, SwizzleLayout, TileLayout
+from tvm.tirx.operator.tile_primitive.ops import Copy
+from tvm.tirx.stmt import BufferRegion
 
 
 def _build_kernel(scope, n_threads, shape, dtype):
@@ -518,6 +524,7 @@ def test_layout_permute_copy_preserves_smem_strides():
 # ``base_off + sum_j bit_j(f) · signed_strides[j]`` precomputed form.
 # ----------------------------------------------------------------------------
 @pytest.mark.gpu
+@pytest.mark.cuda_sm90
 @pytest.mark.skipif(not env.has_cuda_compute(9), reason="need cuda compute >= 9.0")
 def test_gmem_smem_swizzle_fast_path_fires_with_var_bounds():
     """Warp-scope 32x64 fp16 G2S/S2G with 128b swizzled SMEM. Fast path
@@ -570,6 +577,185 @@ def test_gmem_smem_swizzle_fast_path_fires_with_var_bounds():
         B = tvm.runtime.tensor(B_np, device=dev)
         ex(A, B)
         np.testing.assert_allclose(B.numpy(), A_np)
+
+    tvm.testing.run_with_gpu_lock(run_and_check)
+
+
+@pytest.mark.cuda_sm90
+def test_valid_prefix_layout_proof_accepts_row_major_and_rejects_transpose():
+    shape = (64, 128)
+    region = [tvm.ir.Range.from_min_extent(0, extent) for extent in shape]
+    smem = tvm.tirx.decl_buffer(shape, "bfloat16", scope="shared", layout=TileLayout(S[shape]))
+    row_major = tvm.tirx.decl_buffer(shape, "bfloat16", layout=TileLayout(S[shape]))
+    transposed = tvm.tirx.decl_buffer(shape, "bfloat16", layout=TileLayout(S[(64, 128) : (1, 64)]))
+
+    row_call = Copy(
+        BufferRegion(smem, region),
+        BufferRegion(row_major, region),
+        config={"valid_prefix_elements": tvm.tirx.Var("valid", "int32") * 128},
+    )
+    transpose_call = Copy(
+        BufferRegion(smem, region),
+        BufferRegion(transposed, region),
+        config={"valid_prefix_elements": tvm.tirx.Var("valid", "int32") * 128},
+    )
+
+    assert _logical_prefix_layout_ok(row_call) == (True, None)
+    ok, reason = _logical_prefix_layout_ok(transpose_call)
+    assert not ok
+    assert "strictly descending global stride" in reason
+
+
+def _build_valid_prefix_kernel(*, rematerialize_swizzle_offsets=False):
+    shape = (64, 128)
+    g_layout = TileLayout(S[shape])
+    s_layout = ComposeLayout(SwizzleLayout(3, 3, 3), TileLayout(S[shape]))
+
+    @T.prim_func
+    def kernel(
+        A_ptr: T.handle,
+        B_zero_ptr: T.handle,
+        B_skip_ptr: T.handle,
+        valid_rows: T.int32,
+    ) -> None:
+        A = T.match_buffer(A_ptr, shape, "bfloat16", layout=g_layout)
+        B_zero = T.match_buffer(B_zero_ptr, shape, "bfloat16", layout=g_layout)
+        B_skip = T.match_buffer(B_skip_ptr, shape, "bfloat16", layout=g_layout)
+        T.device_entry()
+        T.cta_id([1])
+        T.lane_id([32])
+        T.thread_id([32])
+        smem = T.alloc_buffer(shape, "bfloat16", scope="shared", layout=s_layout)
+
+        Tx.warp.copy(
+            smem[:, :],
+            A[:, :],
+            valid_prefix_elements=valid_rows * shape[1],
+            rematerialize_swizzle_offsets=rematerialize_swizzle_offsets,
+        )
+        T.cuda.warp_sync()
+        Tx.warp.copy(
+            B_zero[:, :],
+            smem[:, :],
+            valid_prefix_elements=shape[0] * shape[1],
+            rematerialize_swizzle_offsets=rematerialize_swizzle_offsets,
+        )
+        T.cuda.warp_sync()
+
+        Tx.warp.copy(
+            smem[:, :],
+            A[:, :],
+            valid_prefix_elements=shape[0] * shape[1],
+            rematerialize_swizzle_offsets=rematerialize_swizzle_offsets,
+        )
+        T.cuda.warp_sync()
+        Tx.warp.copy(
+            B_skip[:, :],
+            smem[:, :],
+            valid_prefix_elements=valid_rows * shape[1],
+            rematerialize_swizzle_offsets=rematerialize_swizzle_offsets,
+        )
+
+    return kernel
+
+
+@pytest.mark.cuda_sm90
+def test_valid_prefix_offsets_remain_expressions_not_local_scalar_buffers():
+    kernel = _build_valid_prefix_kernel()
+    target = tvm.target.Target("cuda")
+    with target:
+        compiled = tvm.compile(tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx")
+
+    src = compiled.mod.imports[0].inspect_source()
+    assert "uint4" in src
+    assert "s_lin_ptr" not in src
+    assert "g_lin_ptr" not in src
+    assert "s_off_ptr" not in src
+
+
+@pytest.mark.cuda_sm90
+def test_rematerialized_bounded_swizzle_offsets_emit_no_signed_stride_arrays():
+    kernel = _build_valid_prefix_kernel(rematerialize_swizzle_offsets=True)
+    target = tvm.target.Target("cuda")
+    with target:
+        compiled = tvm.compile(tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx")
+
+    src = compiled.mod.imports[0].inspect_source()
+    assert "uint4" in src
+    assert "alignas(64) int v_" not in src
+    assert "s_lin_ptr" not in src
+    assert "g_lin_ptr" not in src
+    assert "s_off_ptr" not in src
+
+
+@pytest.mark.cuda_sm90
+def test_rematerialized_swizzle_offsets_require_bounded_swizzled_copy():
+    shape = (64, 128)
+    region = [tvm.ir.Range.from_min_extent(0, extent) for extent in shape]
+    global_buf = tvm.tirx.decl_buffer(shape, "bfloat16", layout=TileLayout(S[shape]))
+    plain_smem = tvm.tirx.decl_buffer(
+        shape, "bfloat16", scope="shared", layout=TileLayout(S[shape])
+    )
+    swizzled_smem = tvm.tirx.decl_buffer(
+        shape,
+        "bfloat16",
+        scope="shared",
+        layout=ComposeLayout(SwizzleLayout(3, 3, 3), TileLayout(S[shape])),
+    )
+
+    unbounded = Copy(
+        BufferRegion(swizzled_smem, region),
+        BufferRegion(global_buf, region),
+        config={"rematerialize_swizzle_offsets": True},
+    )
+    plain = Copy(
+        BufferRegion(plain_smem, region),
+        BufferRegion(global_buf, region),
+        config={
+            "valid_prefix_elements": tvm.tirx.Var("valid", "int32") * 128,
+            "rematerialize_swizzle_offsets": True,
+        },
+    )
+
+    ok, reason = _rematerialized_swizzle_offsets_ok(unbounded)
+    assert not ok
+    assert "requires valid_prefix_elements" in reason
+    ok, reason = _rematerialized_swizzle_offsets_ok(plain)
+    assert not ok
+    assert "requires a swizzled shared-memory layout" in reason
+
+
+@pytest.mark.gpu
+@pytest.mark.cuda_sm90
+@pytest.mark.skipif(not env.has_cuda_compute(9), reason="need cuda compute >= 9.0")
+@pytest.mark.parametrize("valid_rows", [0, 25, 26, 64])
+def test_gmem_smem_valid_prefix_zero_fill_and_skip_store(valid_rows):
+    kernel = _build_valid_prefix_kernel(rematerialize_swizzle_offsets=True)
+    target = tvm.target.Target("cuda")
+    with target:
+        compiled = tvm.compile(tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx")
+
+    src = compiled.mod.imports[0].inspect_source()
+    assert "uint4" in src
+
+    np_dtype = tvm.testing.np_dtype_from_str("bfloat16")
+    A_np = np.arange(64 * 128, dtype="float32").reshape(64, 128).astype(np_dtype)
+    B_zero_np = np.full((64, 128), -7, dtype=np_dtype)
+    B_skip_np = np.full((64, 128), -11, dtype=np_dtype)
+
+    def run_and_check():
+        dev = tvm.cuda(0)
+        A = tvm.runtime.tensor(A_np, dev)
+        B_zero = tvm.runtime.tensor(B_zero_np, dev)
+        B_skip = tvm.runtime.tensor(B_skip_np, dev)
+        compiled(A, B_zero, B_skip, valid_rows)
+
+        expected_zero = np.zeros((64, 128), dtype=np_dtype)
+        expected_zero[:valid_rows] = A_np[:valid_rows]
+        expected_skip = B_skip_np.copy()
+        expected_skip[:valid_rows] = A_np[:valid_rows]
+        np.testing.assert_array_equal(B_zero.numpy(), expected_zero)
+        np.testing.assert_array_equal(B_skip.numpy(), expected_skip)
 
     tvm.testing.run_with_gpu_lock(run_and_check)
 

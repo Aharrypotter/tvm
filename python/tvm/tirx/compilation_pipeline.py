@@ -37,11 +37,11 @@ def default_tir_pipeline():
             tirx.transform.FlattenBuffer(),
             tirx.transform.BF16ComputeLegalize(),
             tirx.transform.NarrowDataType(32),
-            tirx.transform.VectorizeLoop(not bool(config.get("tir.disable_vectorize", False))),
+            tirx.transform.VectorizeLoop(not bool(config.get("tirx.disable_vectorize", False))),
             tirx.transform.UnrollLoop(),
             tirx.transform.StmtSimplify(),
         ]
-        if not bool(config.get("tir.disable_cse_tir", False)):
+        if not bool(config.get("tirx.disable_cse_tir", False)):
             passes.append(tirx.transform.CommonSubexprElim())
         passes.extend(
             [
@@ -76,11 +76,11 @@ def tirx_pipeline():
             tirx.transform.FlattenBuffer(),
             tirx.transform.BF16ComputeLegalize(),
             tirx.transform.NarrowDataType(32),
-            tirx.transform.VectorizeLoop(not bool(config.get("tir.disable_vectorize", False))),
+            tirx.transform.VectorizeLoop(not bool(config.get("tirx.disable_vectorize", False))),
             tirx.transform.UnrollLoop(),
             tirx.transform.StmtSimplify(),
         ]
-        if not bool(config.get("tir.disable_cse_tir", False)):
+        if not bool(config.get("tirx.disable_cse_tir", False)):
             passes.append(tirx.transform.CommonSubexprElim())
         passes.extend(
             [
